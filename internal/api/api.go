@@ -8,7 +8,9 @@ package api
 
 import (
 	_ "embed"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -26,8 +28,9 @@ import (
 
 // Server holds the API's dependencies.
 type Server struct {
-	reg *registry.Registry
-	log *slog.Logger
+	reg   *registry.Registry
+	log   *slog.Logger
+	cache *interfaceCache
 }
 
 // NewServer builds an API server over a registry.
@@ -35,7 +38,7 @@ func NewServer(reg *registry.Registry, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{reg: reg, log: log}
+	return &Server{reg: reg, log: log, cache: newInterfaceCache(interfaceCacheBytes)}
 }
 
 // Routes returns the API's routes, to be mounted under /api.
@@ -161,21 +164,37 @@ func (s *Server) getContract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wasmHash := strings.TrimSpace(r.URL.Query().Get("wasm_hash"))
-	stored, err := s.reg.Store().GetSpec(r.Context(), network, contractID, wasmHash)
-	if err != nil {
-		s.fail(w, r, err)
-		return
+	cacheHash := wasmHash
+	if cacheHash == "" {
+		cacheHash = contract.CurrentWasmHash
+	}
+	key := specCacheKey{network: network, contractID: contractID, wasmHash: cacheHash}
+	cached, ok := s.cache.get(key)
+	if !ok {
+		stored, err := s.reg.Store().GetSpec(r.Context(), network, contractID, cacheHash)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+
+		body, err := json.Marshal(stored.Interface)
+		if err != nil {
+			s.fail(w, r, fmt.Errorf("api: encoding interface for %s: %w", contractID, err))
+			return
+		}
+		cached = cachedInterface{body: body, decodedAt: stored.DecodedAt.UTC()}
+		s.cache.add(key, cached)
 	}
 
 	writeJSON(w, http.StatusOK, contractResponse{
 		ContractID: contract.ContractID,
 		Network:    contract.Network,
-		WasmHash:   stored.WasmHash,
+		WasmHash:   cacheHash,
 		Name:       contract.Name,
 		FirstSeen:  contract.FirstSeen.UTC(),
-		DecodedAt:  stored.DecodedAt.UTC(),
-		Current:    stored.WasmHash == contract.CurrentWasmHash,
-		Interface:  stored.Interface,
+		DecodedAt:  cached.decodedAt,
+		Current:    cacheHash == contract.CurrentWasmHash,
+		Interface:  json.RawMessage(cached.body),
 	})
 }
 
